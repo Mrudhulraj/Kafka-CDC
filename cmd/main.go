@@ -22,7 +22,7 @@ func NewServer() *Server {
 	}
 
 	return &Server{
-		producer: producer.NewKafkaProducer(" "),
+		producer: producer.NewKafkaProducer("myTopic"),
 		consumer: c,
 		msgCH:    msgCH,
 	}
@@ -45,6 +45,9 @@ func (s *Server) handleMsg(msg string) {
 
 func main() {
 	srv := NewServer()
+	// Topic not initialized yet
+
+	// Produce messages now
 	go srv.produceMsg()
 
 	for msg := range srv.msgCH {

@@ -2,6 +2,7 @@ package producer
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	shared "github.com/mrudhulraj/go-kafka/internal/shared"
@@ -23,7 +24,7 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 		panic(err)
 	}
 
-	defer p.Close()
+	// defer p.Close()
 
 	// Delivery report handler for produced messages
 	go func() {
@@ -48,9 +49,13 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 
 func (p *KafkaProducer) Produce(word string) {
 	// Produce messages to topic (asynchronously)
-	p.producer.Produce(&kafka.Message{
+	err := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
 		Value:          []byte(word),
 	}, nil)
+
+	if err != nil {
+		log.Printf("Error: %v", err)
+	}
 
 }
