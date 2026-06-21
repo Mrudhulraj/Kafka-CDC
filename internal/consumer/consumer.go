@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -14,32 +15,76 @@ import (
 type KafkaConsumer struct {
 	consumer *kafka.Consumer
 	topic    string
-	msgCH    chan<- string
+	msgCH    chan<- *shared.Message
 	readyCH  chan struct{}
+	exitCH   chan struct{}
 	isReady  bool
+
+	msgStateMap  map[kafka.Offset]bool
+	lastComitted kafka.Offset
+	maxReceived  *kafka.TopicPartition
+	mu           *sync.RWMutex
+	commitDur    time.Duration
 }
 
-func NewKafkaConsumer(msgch chan<- string) (*KafkaConsumer, error) {
+func NewKafkaConsumerWithListening(msgch chan<- string) (*KafkaConsumer, error) {
 	cfg := shared.NewkafkaConfig()
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": cfg.Host,
-		"group.id":          cfg.ConsumerGroup,
-		"auto.offset.reset": "earliest", // From beginning
+		"bootstrap.servers":  cfg.Host,
+		"group.id":           cfg.ConsumerGroup,
+		"enable.auto.commit": false,
 	})
 
 	if err != nil {
 		return nil, err
 	}
+	// Create a partition
+	tp := kafka.TopicPartition{
+		Topic:     &cfg.Topic,
+		Partition: 0,
+	}
+
+	//Commit to a partition
+	commited, err := c.Committed([]kafka.TopicPartition{tp}, int(time.Second)*5)
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+
+	// Get the latest commit
+	latestCommit := commited[len(commited)-1].Offset
+	logrus.WithField("OFFSET", latestCommit)
+
+	// Track last Offset in a variable
+	maxReceived := &kafka.TopicPartition{
+		Topic:     tp.Topic,
+		Partition: tp.Partition,
+		Offset:    latestCommit,
+	}
 
 	consumer := &KafkaConsumer{
 		consumer: c,
-		topic:    cfg.Topic,
-		msgCH:    msgch,
+		msgCH:    make(chan *shared.Message, 64),
 		readyCH:  make(chan struct{}),
+		exitCH:   make(chan struct{}),
 		isReady:  false,
-	}
-	consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
+		topic:    cfg.Topic,
 
+		mu:           new(sync.RWMutex),
+		msgStateMap:  map[kafka.Offset]bool{},
+		lastComitted: latestCommit,
+		maxReceived:  maxReceived,
+		commitDur:    5 * time.Second,
+	}
+
+	consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
+	err = c.Assign([]kafka.TopicPartition{
+		{
+			Topic:     &cfg.Topic,
+			Partition: tp.Partition,
+			Offset:    latestCommit,
+		},
+	})
 	err = c.SubscribeTopics([]string{cfg.Topic}, nil)
 
 	if err != nil {
@@ -69,10 +114,26 @@ func (c *KafkaConsumer) readMsgLoop() {
 			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
 			continue
 		}
-
-		payload := msg.Value
-		c.msgCH <- string(payload)
+		// Track the message state in the partition
+		c.appendMessageState(&msg.TopicPartition)
+		c.msgCH <- shared.NewMessage(&msg.TopicPartition, msg.Value)
 	}
+}
+
+func (c *KafkaConsumer) appendMessageState(tp *kafka.TopicPartition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Set the state to false since we have not begun processing
+	c.msgStateMap[tp.Offset] = false
+	if c.maxReceived.Offset < tp.Offset {
+		c.maxReceived = &kafka.TopicPartition{
+			Topic:     tp.Topic,
+			Partition: tp.Partition,
+			Offset:    tp.Offset,
+		}
+	}
+
 }
 
 func (c *KafkaConsumer) initializeKafkaTopic(brokers, topicName string) error {
